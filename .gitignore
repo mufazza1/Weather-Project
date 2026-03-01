@@ -1,0 +1,11 @@
+# Ignore logs and data
+*.log
+*.txt
+*.tsv
+weather_report
+weather_report.txt
+rx_poc_log
+historical_fc_accuracy.tsv
+
+# System
+.DS_Store
