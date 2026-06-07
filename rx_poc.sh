@@ -1,120 +1,145 @@
 #!/usr/bin/env bash
+#
+# rx_poc.sh — Weather forecast-accuracy ETL.
+#
+# Each run:
+#   1. Fetches Casablanca weather from wttr.in (JSON).
+#   2. Records today's *observed* temperature and the *forecast for tomorrow*.
+#   3. Once at least two daily readings exist, compares yesterday's
+#      forecast-for-today against today's observed temperature and stores
+#      the error and a quality rating in the history file.
+#
+# Intended to run once per day (see README for cron / Task Scheduler setup).
+
 set -euo pipefail
+IFS=$'\n\t'
 
-# -----------------------------
-# Config
-# -----------------------------
-CITY="Casablanca"
-TZ_NAME="Africa/Casablanca"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib.sh
+source "$SCRIPT_DIR/lib.sh"
 
-LOG_FILE="rx_poc.log"
-HISTORY_FILE="historical_fc_accuracy.tsv"
+# ---------------------------------------------------------------------------
+# Configuration (override via environment variables)
+# ---------------------------------------------------------------------------
+CITY="${CITY:-Casablanca}"
+TZ_NAME="${TZ_NAME:-Africa/Casablanca}"
+DATA_DIR="${DATA_DIR:-$SCRIPT_DIR}"
+READINGS_FILE="${READINGS_FILE:-$DATA_DIR/weather_readings.tsv}"
+HISTORY_FILE="${HISTORY_FILE:-$DATA_DIR/historical_fc_accuracy.tsv}"
 
-# -----------------------------
-# Helpers
-# -----------------------------
-# Keep only digits and minus sign (e.g. "18°C" -> "18", "-2" stays "-2")
-to_int() {
-  echo "$1" | tr -cd '0-9-'
+# TSV schemas (tab-separated)
+#   READINGS_FILE: date  obs_temp  fc_tomorrow
+#   HISTORY_FILE : date  obs_temp  forecast  error  rating
+READINGS_HEADER=$'date\tobs_temp\tfc_tomorrow'
+HISTORY_HEADER=$'date\tobs_temp\tforecast\terror\trating'
+
+# ---------------------------------------------------------------------------
+# Readings file helpers
+# ---------------------------------------------------------------------------
+ensure_readings_file() {
+  [[ -f "$READINGS_FILE" ]] || printf '%s\n' "$READINGS_HEADER" > "$READINGS_FILE"
 }
 
-# -----------------------------
-# 1) Get weather data (clean output, no ASCII art parsing)
-# wttr format:
-#   %t  = current temperature
-#   %T  = feels like
-#   %m  = condition text
-#   %w  = wind
-# Tomorrow noon forecast:
-#   wttr allows day offset: 1 means tomorrow
-#   %t is temperature for that time block
-# -----------------------------
+last_reading_date() {
+  [[ -f "$READINGS_FILE" ]] || return 0
+  tail -n +2 "$READINGS_FILE" | tail -n1 | cut -f1
+}
 
-# Current temperature
-obs_temp_raw="$(curl -fsS "https://wttr.in/${CITY}?format=%t")"
-obs_temp_int="$(to_int "$obs_temp_raw")"
+# Append today's reading. If a reading for the same date already exists,
+# replace it (so re-running on the same day refreshes rather than duplicates).
+record_reading() {
+  local date="$1" obs="$2" fc="$3" last tmp
+  last="$(last_reading_date)"
+  if [[ "$last" == "$date" ]]; then
+    warn "Reading for $date already exists — refreshing it."
+    tmp="$(mktemp)"
+    awk -F'\t' -v d="$date" 'NR==1 || $1!=d' "$READINGS_FILE" > "$tmp"
+    mv "$tmp" "$READINGS_FILE"
+  fi
+  printf '%s\t%s\t%s\n' "$date" "$obs" "$fc" >> "$READINGS_FILE"
+}
 
-# Forecast temp around noon tomorrow (approx):
-# Using format with day offset is not perfect for "noon", but most stable in wttr:
-# We'll use "tomorrow" general temp as forecast proxy.
-# If you want *more detailed* later, we can switch to JSON API.
-fc_temp_raw="$(curl -fsS "https://wttr.in/${CITY}?format=1")"
-# Extract first "+NN" or "-NN" from the one-line summary
-fc_temp_int="$(echo "$fc_temp_raw" | grep -Eo '[+-]?[0-9]+' | head -n1 | tr -d '+')"
+reading_count() {
+  [[ -f "$READINGS_FILE" ]] || { printf '0'; return 0; }
+  tail -n +2 "$READINGS_FILE" | grep -c . || true
+}
 
-# Fallback if forecast parsing fails
-if [[ -z "${fc_temp_int:-}" ]]; then
-  fc_temp_int="$obs_temp_int"
-fi
+# ---------------------------------------------------------------------------
+# History file helpers
+# ---------------------------------------------------------------------------
+ensure_history_file() {
+  [[ -f "$HISTORY_FILE" ]] || printf '%s\n' "$HISTORY_HEADER" > "$HISTORY_FILE"
+}
 
-echo "The current Temperature of $CITY: ${obs_temp_int} °C"
-echo "The forecasted temperature for tomorrow (summary) for $CITY: ${fc_temp_int} °C"
+history_has_date() {
+  [[ -f "$HISTORY_FILE" ]] || return 1
+  tail -n +2 "$HISTORY_FILE" | cut -f1 | grep -qx "$1"
+}
 
-# -----------------------------
-# 2) Date values (timezone-based)
-# -----------------------------
-year="$(TZ="$TZ_NAME" date +%Y)"
-month="$(TZ="$TZ_NAME" date +%m)"
-day="$(TZ="$TZ_NAME" date +%d)"
+# ---------------------------------------------------------------------------
+# Accuracy: compare the previous day's forecast (made for "today")
+# against today's observed temperature.
+# ---------------------------------------------------------------------------
+compute_and_store_accuracy() {
+  local today="$1" rows prev_fc today_obs error rating
+  rows="$(reading_count)"
+  if (( rows < 2 )); then
+    log "Only $rows reading(s) so far — need 2 to score accuracy. Run again tomorrow."
+    return 0
+  fi
 
-# -----------------------------
-# 3) Write log line (TAB-separated)
-# columns: year month day obs_temp fc_temp
-# -----------------------------
-if [[ ! -s "$LOG_FILE" ]]; then
-printf "%s\t%s\t%s\t%s\t%s\n" "$year" "$month" "$day" "$obs_temp_int" "$fc_temp_int" >> "$LOG_FILE"
-fi
-# -----------------------------
-# 4) Calculate accuracy using last two rows (needs at least 2 lines)
-# accuracy = yesterday_forecast - today_observed
-# -----------------------------
-lines="$(wc -l < "$LOG_FILE" | tr -d ' ')"
+  prev_fc="$(tail -n +2 "$READINGS_FILE" | tail -n2 | head -n1 | cut -f3)"
+  today_obs="$(tail -n +2 "$READINGS_FILE" | tail -n1 | cut -f2)"
+  prev_fc="$(to_int "$prev_fc")"
+  today_obs="$(to_int "$today_obs")"
+  is_int "$prev_fc"   || die "Could not parse previous forecast from $READINGS_FILE."
+  is_int "$today_obs" || die "Could not parse today's observation from $READINGS_FILE."
 
-if (( lines < 2 )); then
-  echo "Not enough log history yet (need 2 runs). Run again tomorrow."
-  exit 0
-fi
+  error=$(( prev_fc - today_obs ))
+  rating="$(classify_accuracy "$error")"
+  log "Forecast error for $today: ${error}°C (forecast ${prev_fc}°C vs observed ${today_obs}°C) → $rating"
 
-# Read values from last 2 rows (TAB-separated)
-yesterday_fc="$(tail -n 2 "$LOG_FILE" | head -1 | cut -d " " -f5)"
-today_temp="$(tail -n 1 "$LOG_FILE" | cut -d " " -f4)"
+  ensure_history_file
+  if history_has_date "$today"; then
+    warn "History already contains a row for $today — not appending a duplicate."
+    return 0
+  fi
+  printf '%s\t%s\t%s\t%s\t%s\n' "$today" "$today_obs" "$prev_fc" "$error" "$rating" >> "$HISTORY_FILE"
+  log "Appended accuracy record to $HISTORY_FILE"
+}
 
-# Ensure they are integers
-yesterday_fc="$(to_int "$yesterday_fc")"
-today_temp="$(to_int "$today_temp")"
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+main() {
+  require_cmd curl awk date grep cut
 
-# If still empty, stop safely
-if [[ -z "$yesterday_fc" || -z "$today_temp" ]]; then
-  echo "Could not parse yesterday_fc/today_temp from log. Check $LOG_FILE formatting."
-  exit 1
-fi
+  local today tomorrow json obs_temp fc_raw fc_temp
+  today="$(today_date)"
+  tomorrow="$(tomorrow_date)"
 
-accuracy=$((yesterday_fc - today_temp))
-echo "accuracy is $accuracy"
+  log "Fetching weather for ${CITY} (today=${today}, tomorrow=${tomorrow}) ..."
+  json="$(fetch_weather_json "$CITY")" || die "Failed to fetch weather data for ${CITY}."
 
-# -----------------------------
-# 5) Accuracy range (fixed bash arithmetic conditions)
-# -----------------------------
-if (( accuracy >= -1 && accuracy <= 1 )); then
-  accuracy_range="excellent"
-elif (( accuracy >= -2 && accuracy <= 2 )); then
-  accuracy_range="good"
-elif (( accuracy >= -3 && accuracy <= 3 )); then
-  accuracy_range="fair"
-else
-  accuracy_range="poor"
-fi
+  obs_temp="$(printf '%s' "$json" | json_current_temp)"
+  obs_temp="$(to_int "$obs_temp")"
+  is_int "$obs_temp" || die "Could not parse current temperature from weather data."
 
-echo "Forecast accuracy is $accuracy_range"
+  fc_raw="$(printf '%s' "$json" | json_forecast_noon "$tomorrow")"
+  if ! is_int "$(to_int "$fc_raw")"; then
+    warn "Noon forecast for $tomorrow unavailable — using tomorrow's average instead."
+    fc_raw="$(printf '%s' "$json" | json_forecast_avg "$tomorrow")"
+  fi
+  fc_temp="$(to_int "$fc_raw")"
+  is_int "$fc_temp" || die "Could not parse tomorrow's forecast temperature."
 
-# -----------------------------
-# 6) Append to history file (TSV)
-# columns: year month day today_temp yesterday_fc accuracy accuracy_range
-# -----------------------------
-# Create header if file doesn't exist
-if [[ ! -f "$HISTORY_FILE" ]]; then
-  printf "year\tmonth\tday\ttoday_temp\tyesterday_fc\taccuracy\taccuracy_range\n" > "$HISTORY_FILE"
-fi
+  log "Observed ${today}: ${obs_temp}°C  |  Forecast for ${tomorrow}: ${fc_temp}°C"
 
-printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
-  "$year" "$month" "$day" "$today_temp" "$yesterday_fc" "$accuracy" "$accuracy_range" >> "$HISTORY_FILE"
+  ensure_readings_file
+  record_reading "$today" "$obs_temp" "$fc_temp"
+  compute_and_store_accuracy "$today"
+
+  log "Done."
+}
+
+main "$@"

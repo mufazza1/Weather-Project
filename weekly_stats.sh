@@ -1,43 +1,69 @@
 #!/usr/bin/env bash
-set -euo pipefail
+#
+# weekly_stats.sh — summarize recent forecast accuracy.
+#
+# Reads the history file produced by rx_poc.sh and prints a report over the
+# last N data rows (default 7). "Accuracy" is the signed error in °C
+# (forecast - observed); it is judged by distance from zero, so the best day
+# is the one closest to 0 and the worst is the one farthest from it.
+#
+# Usage: ./weekly_stats.sh [N]
 
-HISTORY_FILE="historical_fc_accuracy.tsv"
+set -euo pipefail
+IFS=$'\n\t'
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib.sh
+source "$SCRIPT_DIR/lib.sh"
+
+DATA_DIR="${DATA_DIR:-$SCRIPT_DIR}"
+HISTORY_FILE="${HISTORY_FILE:-$DATA_DIR/historical_fc_accuracy.tsv}"
+WINDOW="${1:-7}"
+
+is_int "$WINDOW" && (( WINDOW > 0 )) || die "Window must be a positive integer (got: '$WINDOW')."
 
 if [[ ! -f "$HISTORY_FILE" ]]; then
-  echo "No historical data found."
-  exit 1
+  die "No historical data found at $HISTORY_FILE. Run rx_poc.sh first."
 fi
 
-# Skip header and analyze last 7 entries
-data="$(tail -n 7 "$HISTORY_FILE" | awk 'NR>1')"
+# History columns: date  obs_temp  forecast  error  rating  ($4 = error, $5 = rating)
+# Skip the header (line 1) and keep the last WINDOW data rows.
+data="$(tail -n +2 "$HISTORY_FILE" | tail -n "$WINDOW")"
 
 if [[ -z "$data" ]]; then
-  echo "Not enough data for weekly stats."
+  log "Not enough data for a report yet (history is empty)."
   exit 0
 fi
 
-days="$(echo "$data" | wc -l)"
+days="$(printf '%s\n' "$data" | grep -c .)"
 
-avg_accuracy="$(echo "$data" | awk '{sum+=$6} END { if (NR>0) print sum/NR; else print 0 }')"
+# Average / best / worst, all based on the absolute error.
+read -r avg best worst <<<"$(printf '%s\n' "$data" | awk -F'\t' '
+  {
+    e = $4; if (e < 0) e = -e
+    sum += e
+    if (NR == 1 || e < min) min = e
+    if (NR == 1 || e > max) max = e
+  }
+  END {
+    if (NR > 0) printf "%.2f\t%d\t%d", sum/NR, min, max
+    else        printf "0\t0\t0"
+  }')"
 
-best_accuracy="$(echo "$data" | awk 'NR==1 || $6 < min {min=$6} END {print min}')"
+# Distribution across rating categories (exact match on the rating column).
+read -r excellent good fair poor <<<"$(printf '%s\n' "$data" | awk -F'\t' '
+  { c[$5]++ }
+  END { printf "%d\t%d\t%d\t%d", c["excellent"], c["good"], c["fair"], c["poor"] }')"
 
-worst_accuracy="$(echo "$data" | awk 'NR==1 || $6 > max {max=$6} END {print max}')"
-
-excellent="$(echo "$data" | grep -c excellent || true)"
-good="$(echo "$data" | grep -c good || true)"
-fair="$(echo "$data" | grep -c fair || true)"
-poor="$(echo "$data" | grep -c poor || true)"
-
-echo "Weekly Forecast Accuracy Report"
-echo "--------------------------------"
-echo "Days analyzed: $days"
-echo "Average accuracy: $avg_accuracy °C"
-echo "Best accuracy: $best_accuracy °C"
-echo "Worst accuracy: $worst_accuracy °C"
-echo ""
-echo "Accuracy distribution:"
-echo "  Excellent: $excellent"
-echo "  Good:      $good"
-echo "  Fair:      $fair"
-echo "  Poor:      $poor"
+printf 'Weekly Forecast Accuracy Report\n'
+printf -- '--------------------------------\n'
+printf 'Days analyzed:    %s\n'   "$days"
+printf 'Mean abs error:   %s °C\n' "$avg"
+printf 'Best (closest):   %s °C\n' "$best"
+printf 'Worst (farthest): %s °C\n' "$worst"
+printf '\n'
+printf 'Accuracy distribution:\n'
+printf '  Excellent (<=1°C): %s\n' "$excellent"
+printf '  Good      (<=2°C): %s\n' "$good"
+printf '  Fair      (<=3°C): %s\n' "$fair"
+printf '  Poor      ( >3°C): %s\n' "$poor"

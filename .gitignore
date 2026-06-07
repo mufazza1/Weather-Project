@@ -1,11 +1,16 @@
-# Ignore logs and data
-*.log
-*.txt
+# Generated data & logs (produced at runtime — do not commit)
 *.tsv
-weather_report
-weather_report.txt
-rx_poc_log
+*.log
+weather_readings.tsv
 historical_fc_accuracy.tsv
 
-# System
+# Downloaded API responses at the project root
+/wttr.json
+
+# Test fixtures are committed even though they are JSON; nothing to ignore there.
+
+# OS / editor cruft
 .DS_Store
+Thumbs.db
+*.swp
+*~
